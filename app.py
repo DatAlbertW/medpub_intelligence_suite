@@ -312,19 +312,143 @@ def get_groq_client(key: str) -> Groq:
 
 
 def extract_text_from_pdf(uploaded_file) -> list[dict]:
-    """Extract title + abstract from each page of a PDF."""
-    docs = []
+    """
+    Smart PDF extractor:
+    A) Multi-abstract compilation PDF (e.g. PubMed export saved as PDF):
+       Splits on numbered entries "1. Journal Year..." and parses each block.
+    B) Single paper PDF: extracts one record via title/abstract heuristics.
+    """
     pdf_bytes = uploaded_file.read()
     pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for i, page in enumerate(pdf):
-        text = page.get_text()
-        # Naively use first 80 chars as 'title' and rest as abstract
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        title    = lines[0] if lines else f"Document page {i+1}"
-        abstract = " ".join(lines[1:]) if len(lines) > 1 else text
-        docs.append({"title": title, "abstract": abstract[:2000]})
-    return docs
+    full_text = "\n".join(page.get_text() for page in pdf)
 
+    # ── Detect numbered multi-abstract format ────────────────────────────────
+    # Blocks start with lines like: "1. JAMA. 2024 ..."
+    numbered_blocks = re.split(r'(?m)^(?=\d+\.\s+[A-Z])', full_text.strip())
+    numbered_blocks = [b.strip() for b in numbered_blocks if b.strip()]
+
+    citation_like = re.compile(
+        r'^\d+\.\s+\S.*?\d{4}.*?doi', re.DOTALL | re.IGNORECASE
+    )
+    is_multi = (
+        len(numbered_blocks) >= 2 and
+        sum(1 for b in numbered_blocks if citation_like.match(b)) >= 2
+    )
+
+    if is_multi:
+        docs = []
+        for block in numbered_blocks:
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
+            if not lines:
+                continue
+
+            # ── Citation line (line 0): "N. Journal. Year;..." ───────────────
+            citation_line = lines[0]
+
+            # Journal: text between the leading number and the first year
+            journal = ""
+            j_match = re.match(r'\d+\.\s+(.+?)(?:\s+\d{4}|$)', citation_line)
+            if j_match:
+                journal = j_match.group(1).strip().rstrip(".,;")
+
+            # Year
+            year = ""
+            y_match = re.search(r'\b(20\d{2}|19\d{2})\b', citation_line)
+            if y_match:
+                year = y_match.group(1)
+
+            # ── Title & Authors from subsequent lines ────────────────────────
+            # Title may span multiple lines; stop when we hit author line or abstract
+            title_parts = []
+            authors = ""
+            for line in lines[1:]:
+                # Skip DOI / PMID / copyright / conflict / collaborator lines
+                if re.match(r'(DOI:|PMID:|PMCID:|Copyright|Conflict|Erratum|Comment|Collaborators:)', line, re.I):
+                    continue
+                # Author-line heuristic: "Smith AB(1), Jones CD(2)..." pattern
+                looks_like_authors = bool(re.search(r'[A-Z]{1,3}\(\d+\)', line))
+                # Abstract section start
+                looks_like_abstract = bool(re.match(r'(IMPORTANCE|BACKGROUND|OBJECTIVE|METHODS|RESULTS)', line, re.I))
+
+                if not looks_like_authors and not looks_like_abstract and not title_parts:
+                    # Start collecting title
+                    title_parts.append(line.rstrip("."))
+                elif not looks_like_authors and not looks_like_abstract and title_parts:
+                    # Continue title if line doesn't end with period (mid-title wrap)
+                    prev = title_parts[-1]
+                    if not prev.endswith((".","?","!")):
+                        title_parts.append(line.rstrip("."))
+                    else:
+                        break  # previous line ended title
+                elif looks_like_authors and not authors and title_parts:
+                    raw = re.sub(r'\(\d+\)', '', line)
+                    parts = [p.strip() for p in raw.split(";")[0].split(",") if p.strip()]
+                    authors = ", ".join(parts[:4])
+                    if len(parts) > 4:
+                        authors += " et al."
+                    break
+                elif looks_like_abstract:
+                    break
+
+            title = " ".join(title_parts).strip() if title_parts else citation_line[:150]
+            # ── Clean up stray date/DOI/Epub prefixes from title ─────────────
+            title = re.sub(r'^(?:\d{4}\s+)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s+', '', title).strip()
+            title = re.sub(r'^(?:\d+\.\s*)?(?:10\.\d{4,}/\S+\s+)', '', title).strip()
+            title = re.sub(r'^Epub\s+\S+\s+', '', title, flags=re.IGNORECASE).strip()
+            # If title still starts with a number+journal pattern, it's a bad parse — skip block
+            if re.match(r'^\d+\.\s+[A-Z]', title):
+                continue
+
+            # ── Abstract text ────────────────────────────────────────────────
+            abs_match = re.search(
+                r'(?:IMPORTANCE|BACKGROUND|OBJECTIVE)[:\s](.+?)(?=\nDOI:|\nPMID:|\nCopyright|\Z)',
+                block, re.DOTALL | re.IGNORECASE
+            )
+            if abs_match:
+                abstract_text = re.sub(r'\s+', ' ', abs_match.group(0)).strip()
+            else:
+                try:
+                    idx = block.index(title)
+                    abstract_text = re.sub(
+                        r'\s+', ' ',
+                        block[idx + len(title):idx + len(title) + 3000]
+                    ).strip()
+                except ValueError:
+                    abstract_text = re.sub(r'\s+', ' ', block[:3000]).strip()
+
+            docs.append({
+                "title":    title,
+                "abstract": abstract_text[:2500],
+                "year":     year,
+                "journal":  journal,
+                "authors":  authors,
+            })
+        return docs
+
+    # ── Single paper PDF fallback ─────────────────────────────────────────────
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+    candidates = [l for l in lines[:40] if len(l) > 20 and not l.startswith("http")]
+    title = max(candidates, key=len) if candidates else (lines[0] if lines else uploaded_file.name)
+
+    year_match = re.search(r'\b(20[0-2]\d|19[89]\d)\b', full_text[:2000])
+    year = year_match.group(1) if year_match else ""
+
+    journal = ""
+    jm = re.search(
+        r'\b(N Engl J Med|NEJM|JAMA|Lancet|BMJ|Nature Medicine|Ann Intern Med|'
+        r'Diabetes Care|JACC|Circulation|Journal of Clinical Oncology)[^\n]{0,40}',
+        full_text[:3000], re.IGNORECASE
+    )
+    if jm:
+        journal = jm.group(0).strip()[:80]
+
+    abs_match = re.search(
+        r'(?:Abstract|ABSTRACT)\s*[\n\r]+(.*?)(?=\n(?:Introduction|Background|Methods|Keywords|1\.))',
+        full_text, re.DOTALL
+    )
+    abstract = re.sub(r'\s+', ' ', abs_match.group(1)).strip() if abs_match else re.sub(r'\s+', ' ', full_text[:3000]).strip()
+
+    return [{"title": title, "abstract": abstract[:2500], "year": year, "journal": journal, "authors": ""}]
 
 def parse_pubmed_csv(uploaded_file) -> list[dict]:
     """Parse a PubMed CSV export into a list of {title, abstract} dicts."""
@@ -537,7 +661,7 @@ if pdf_files:
     for pf in pdf_files:
         extracted = extract_text_from_pdf(pf)
         documents.extend(extracted)
-    st.success(f"✅ Extracted **{len(documents)}** pages from PDF(s).")
+    st.success(f"✅ Extracted **{len(documents)}** abstract(s) from PDF(s).")
 
 # ── Demo mode ──────────────────────────────────────────────────────
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
@@ -666,12 +790,13 @@ if st.session_state.get("documents"):
                 <div style='display:flex; justify-content:space-between; align-items:flex-start;'>
                     <div style='flex:1; padding-right:1rem;'>
                         <div style='font-weight:600; color:#E8EDF2; margin-bottom:4px;'>
-                            {doc['title'][:120]}
+                            {doc['title']}
                         </div>
                         <div style='font-size:0.8rem; color:#7A9BBF; margin-bottom:8px;'>
-                            {doc.get('study_type','?')} &nbsp;·&nbsp;
-                            {doc.get('year','')} &nbsp;·&nbsp;
-                            {doc.get('journal','')}
+                            {doc.get('study_type','?')}
+                            {(' &nbsp;·&nbsp; ' + doc['authors']) if doc.get('authors') else ''}
+                            {(' &nbsp;·&nbsp; ' + doc['year']) if doc.get('year') else ''}
+                            {(' &nbsp;·&nbsp; ' + doc['journal']) if doc.get('journal') else ''}
                         </div>
                         <div style='font-size:0.82rem; color:#C9D6E3;'>
                             🎯 <strong>Key endpoint:</strong> {doc.get('key_endpoint','N/A')}
@@ -700,6 +825,7 @@ if st.session_state.get("documents"):
             "Reasoning":   d.get("reasoning", ""),
             "Year":        d.get("year", ""),
             "Journal":     d.get("journal", ""),
+            "Authors":     d.get("authors", ""),
         } for d in screened])
 
         st.download_button(
