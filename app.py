@@ -2,7 +2,7 @@
 MedPub Intelligence Suite
 =========================
 A POC demonstrating AI-powered publication planning for medical communications.
-Built with Streamlit + Groq (Llama 3).
+Built with Streamlit + Groq (Llama 3) for ContentEd Med pitch.
 
 Pipeline:
   1. Upload PubMed CSV or PDF abstracts
@@ -377,20 +377,31 @@ Return ONLY valid JSON (no markdown, no explanation outside JSON):
 
         try:
             response = client.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a systematic review expert. You ALWAYS respond with valid JSON only. No markdown fences, no explanations, no text before or after the JSON object."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.1,
-                max_tokens=300,
+                max_tokens=400,
             )
             raw = response.choices[0].message.content.strip()
-            # Strip any accidental markdown fences
-            raw = re.sub(r"```json|```", "", raw).strip()
+            # Aggressively strip any markdown fences or surrounding text
+            raw = re.sub(r"```json\s*", "", raw)
+            raw = re.sub(r"```\s*", "", raw)
+            # Extract just the JSON object if there's surrounding text
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                raw = match.group(0)
             parsed = json.loads(raw)
-        except Exception:
+        except Exception as e:
             parsed = {
                 "decision": "MAYBE",
                 "confidence": 0.5,
-                "reasoning": "Could not parse AI response.",
+                "reasoning": f"Parsing error: {str(e)[:80]}",
                 "study_type": "Unknown",
                 "key_endpoint": "N/A",
             }
@@ -449,13 +460,23 @@ Return ONLY valid JSON:
 }}"""
 
     response = client.chat.completions.create(
-        model="llama3-70b-8192",
-        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a senior medical publications strategist. You ALWAYS respond with valid JSON only. No markdown fences, no explanations, no text before or after the JSON object."
+            },
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.2,
         max_tokens=1500,
     )
     raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"```json|```", "", raw).strip()
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```\s*", "", raw)
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
     return json.loads(raw)
 
 
