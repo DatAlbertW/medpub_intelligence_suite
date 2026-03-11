@@ -554,65 +554,92 @@ def analyse_gaps_and_plan(client: Groq, screened: list[dict], indication: str) -
     """
     Send included abstracts to the LLM to identify evidence gaps
     and generate a structured publication plan.
+    Retries once with a simpler prompt if the first attempt returns malformed JSON.
     """
     included = [d for d in screened if d["decision"] in ("INCLUDE", "MAYBE")]
     summary_block = "\n".join(
         f"- [{d.get('study_type','?')}] {d['title']} | Endpoint: {d.get('key_endpoint','?')}"
-        for d in included[:30]  # cap tokens
+        for d in included[:20]  # cap to avoid token overflow
     )
 
-    prompt = f"""You are a senior medical publications strategist.
+    def _build_prompt(short: bool = False) -> str:
+        n_gaps = "3" if short else "4-5"
+        n_pubs = "3" if short else "4-6"
+        return f"""You are a senior medical publications strategist.
 
 Therapeutic area: {indication or "general medicine"}
 
 Included evidence ({len(included)} studies):
 {summary_block}
 
-Your task:
-1. Identify the top 4-5 evidence GAPS (topics with insufficient or missing coverage).
-2. Propose a publication plan with 4-6 specific manuscripts.
-
-Return ONLY valid JSON:
+Return ONLY a valid JSON object — no prose, no markdown, no explanation.
+Identify {n_gaps} evidence gaps and propose {n_pubs} manuscripts:
 {{
+  "strategic_summary": "2-3 sentence executive summary",
   "evidence_gaps": [
-    {{
-      "gap": "short title of the gap",
-      "description": "1-2 sentences explaining why this is a gap",
-      "priority": "High | Medium | Low"
-    }}
+    {{"gap": "short gap title", "description": "1 sentence", "priority": "High"}}
   ],
   "publication_plan": [
-    {{
-      "title": "Proposed manuscript title",
-      "type": "Original Research | Review | Meta-analysis | Case Series | Opinion",
-      "journal_tier": "Tier 1 (IF>10) | Tier 2 (IF 5-10) | Tier 3 (IF<5)",
-      "addresses_gap": "which gap this addresses",
-      "timeline_months": 6,
-      "rationale": "one sentence"
-    }}
-  ],
-  "strategic_summary": "2-3 sentence executive summary of the publication landscape"
+    {{"title": "Manuscript title", "type": "Review", "journal_tier": "Tier 1 (IF>10)", "addresses_gap": "gap title", "timeline_months": 6, "rationale": "one sentence"}}
+  ]
 }}"""
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a senior medical publications strategist. You ALWAYS respond with valid JSON only. No markdown fences, no explanations, no text before or after the JSON object."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=1500,
-    )
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"```json\s*", "", raw)
-    raw = re.sub(r"```\s*", "", raw)
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if match:
-        raw = match.group(0)
-    return json.loads(raw)
+    def _call_llm(prompt: str, max_tok: int) -> str:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior medical publications strategist. "
+                        "Output ONLY a single valid JSON object. "
+                        "Do NOT include markdown fences, prose, or any text outside the JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=max_tok,
+        )
+        return resp.choices[0].message.content.strip()
+
+    def _parse(raw: str) -> dict:
+        raw = re.sub(r"```json\s*", "", raw)
+        raw = re.sub(r"```\s*", "", raw)
+        # Extract outermost JSON object
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        return json.loads(raw)
+
+    # ── First attempt ────────────────────────────────────────────────────────
+    try:
+        raw = _call_llm(_build_prompt(short=False), max_tok=3000)
+        return _parse(raw)
+    except (json.JSONDecodeError, Exception):
+        pass  # fall through to retry
+
+    # ── Retry with shorter prompt and higher token budget ────────────────────
+    try:
+        raw = _call_llm(_build_prompt(short=True), max_tok=4000)
+        return _parse(raw)
+    except (json.JSONDecodeError, Exception) as e:
+        # Return a safe fallback so the app doesn't crash
+        return {
+            "strategic_summary": (
+                f"Analysis could not be completed automatically for "
+                f"{indication or 'this indication'}. "
+                "Please try again or reduce the number of included studies."
+            ),
+            "evidence_gaps": [
+                {
+                    "gap": "Automated analysis failed",
+                    "description": f"Error: {str(e)[:120]}",
+                    "priority": "High",
+                }
+            ],
+            "publication_plan": [],
+        }
 
 
 # ════════════════════════════════════════════════════════════════════════════
