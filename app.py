@@ -337,6 +337,8 @@ def extract_text_from_pdf(uploaded_file) -> list[dict]:
 
     if is_multi:
         docs = []
+        _carry_year = ""
+        _carry_journal = ""
         for block in numbered_blocks:
             lines = [l.strip() for l in block.split("\n") if l.strip()]
             if not lines:
@@ -394,10 +396,19 @@ def extract_text_from_pdf(uploaded_file) -> list[dict]:
             # ── Clean up stray date/DOI/Epub prefixes from title ─────────────
             title = re.sub(r'^(?:\d{4}\s+)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s+', '', title).strip()
             title = re.sub(r'^(?:\d+\.\s*)?(?:10\.\d{4,}/\S+\s+)', '', title).strip()
+            title = re.sub(r'^\d+\.\d+/\S+\s+', '', title).strip()  # catch bare DOI prefix
             title = re.sub(r'^Epub\s+\S+\s+', '', title, flags=re.IGNORECASE).strip()
-            # If title still starts with a number+journal pattern, it's a bad parse — skip block
+            # If title still starts with a number+journal pattern, save metadata for next block
             if re.match(r'^\d+\.\s+[A-Z]', title):
+                _carry_year = year
+                _carry_journal = journal
                 continue
+            # Apply carried metadata from a page-break-split citation block
+            if not year and _carry_year:
+                year = _carry_year
+            if not journal and _carry_journal:
+                journal = _carry_journal
+            _carry_year = _carry_journal = ""
 
             # ── Abstract text ────────────────────────────────────────────────
             abs_match = re.search(
@@ -785,6 +796,13 @@ if st.session_state.get("documents"):
             conf  = doc.get("confidence", 0)
             conf_pct = int(conf * 100)
 
+            # Build metadata line outside f-string to avoid Streamlit HTML glitches
+            _meta_parts = [doc.get('study_type', '?')]
+            if doc.get('authors'): _meta_parts.append(doc['authors'])
+            if doc.get('year'):    _meta_parts.append(doc['year'])
+            if doc.get('journal'): _meta_parts.append(doc['journal'])
+            meta_line = ' &nbsp;·&nbsp; '.join(_meta_parts)
+
             st.markdown(f"""
             <div class='card' style='margin-bottom:0.6rem;'>
                 <div style='display:flex; justify-content:space-between; align-items:flex-start;'>
@@ -793,10 +811,7 @@ if st.session_state.get("documents"):
                             {doc['title']}
                         </div>
                         <div style='font-size:0.8rem; color:#7A9BBF; margin-bottom:8px;'>
-                            {doc.get('study_type','?')}
-                            {(' &nbsp;·&nbsp; ' + doc['authors']) if doc.get('authors') else ''}
-                            {(' &nbsp;·&nbsp; ' + doc['year']) if doc.get('year') else ''}
-                            {(' &nbsp;·&nbsp; ' + doc['journal']) if doc.get('journal') else ''}
+                            {meta_line}
                         </div>
                         <div style='font-size:0.82rem; color:#C9D6E3;'>
                             🎯 <strong>Key endpoint:</strong> {doc.get('key_endpoint','N/A')}
