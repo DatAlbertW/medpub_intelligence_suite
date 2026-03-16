@@ -758,8 +758,7 @@ if st.session_state.get("documents"):
             The AI will assess each for clinical relevance to
             <strong style='color:#D4A843;'>{indication or "the selected indication"}</strong>,
             classify the study type, extract the key endpoint, and recommend
-            include / exclude / maybe with a confidence score — mirroring
-            tools like <em>Rayyan</em>, built in-house.
+            include / exclude / maybe with a confidence score.
         </div>
     </div>
     """, unsafe_allow_html=True)
